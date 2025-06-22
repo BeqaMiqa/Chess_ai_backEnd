@@ -157,8 +157,8 @@ async def scan_chessboard(file: UploadFile = File(...)):
     cropped = crop_image(img,pts)
     cropped = cv2.resize(cropped,(512,512),cv2.INTER_AREA)
 
-    gray = cv2.cvtColor(cropped,cv2.COLOR_BGR2GRAY)
-    inp  = (gray.astype(np.float32)/255.0)[...,None][None,...]
+    inp = cropped.astype(np.float32) / 255.0            # shape (512,512,3)
+    inp = inp[None, ...]                                # shape (1,512,512,3)
 
     preds = ensemble_predict(inp)            # (1,64,13)
     grid  = np.argmax(preds,axis=-1).reshape(8,8)
