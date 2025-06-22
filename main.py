@@ -1,195 +1,223 @@
+# main.py
+
+import io
 import base64
+
 import numpy as np
 import cv2
-
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from tensorflow import keras
 import tensorflow as tf
+from tensorflow import keras
 
-# ── FastAPI + CORS setup ─────────────────────────────────────────────────
+# ── FastAPI app + CORS ────────────────────────────────────────────────────
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten in prod!
+    allow_origins=["*"],      # allow all origins (you can lock this down)
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# ── Board detection helpers (unchanged) ──────────────────────────────────
+# ── ChessboardLayer & loss (for model_a/model_b) ──────────────────────────
+
+class ChessboardLayer(keras.layers.Layer):
+    def __init__(self, **kwargs):
+        kwargs.pop("dynamic", None)
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        # inputs: [batch, H, W, C]
+        boards = tf.unstack(inputs, axis=0)
+        out_boards = []
+        for b in boards:
+            b = tf.expand_dims(b, 0)  # [1, H, W, C]
+            rows = tf.split(b, 8, axis=1)
+            row_cells = []
+            for r in rows:
+                cells = tf.split(r, 8, axis=2)
+                flat = [tf.reshape(c, [1,1,1,-1]) for c in cells]
+                row_cells.append(tf.concat(flat, axis=2))  # [1,1,8,F]
+            out_boards.append(tf.concat(row_cells, axis=1))  # [1,8,8,F]
+        return tf.concat(out_boards, axis=0)  # [batch,8,8,F]
+
+    def compute_output_shape(self, input_shape):
+        b, H, W, C = input_shape
+        cell_feat = (H*W*C)//64
+        return (b, 8, 8, cell_feat)
+
+def weighted_loss(y_true, y_pred):
+    # must match how the models were trained
+    weights = tf.constant([1.0,4.0,8.0,8.0,8.0,8.0,4.0], dtype=tf.float32)
+    loss = keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+    idxs = tf.reshape(y_true, (-1,))
+    wts  = tf.reshape(tf.gather(weights, idxs), loss.shape)
+    return loss * wts
+
+# ── Board detection & cropping from demo ─────────────────────────────────
+
 def get_angle(ab, ac):
-    cosv = (ab @ ac) / (np.linalg.norm(ab) * np.linalg.norm(ac))
-    cosv = np.clip(cosv, -1, 1)
-    return np.degrees(np.arccos(cosv))
+    cosv = (ab@ac)/(np.linalg.norm(ab)*np.linalg.norm(ac))
+    return np.degrees(np.arccos(np.clip(cosv, -1, 1)))
 
 def check_square(pts):
-    if len(pts) != 4:
-        return 4 * 90**2, 0
+    if len(pts)!=4:
+        return 4*90**2, 0
     a,b,c,d = np.squeeze(pts)
-    angles = [
+    angs = [
         get_angle(b-c, d-c),
         get_angle(c-d, a-d),
         get_angle(d-a, b-a),
         get_angle(a-b, c-b),
     ]
-    error = np.sum((np.array(angles)-90)**2)
-    side  = np.mean([np.linalg.norm(a-b), np.linalg.norm(b-c),
-                     np.linalg.norm(c-d), np.linalg.norm(d-a)])
-    return error, side
+    err  = np.sum((np.array(angs)-90)**2)
+    side = np.mean([
+        np.linalg.norm(a-b),
+        np.linalg.norm(b-c),
+        np.linalg.norm(c-d),
+        np.linalg.norm(d-a),
+    ])
+    return err, side
 
-def child_count(i, hierarchy, is_square):
+def child_count(i, hierarchy, is_sq):
     j = hierarchy[0,i,2]
-    if j < 0: return 0
-    while hierarchy[0,j,0] > 0:
+    if j<0: return 0
+    # go to first child
+    while hierarchy[0,j,0]>0:
         j = hierarchy[0,j,0]
     cnt = 0
-    while j >= 0:
-        if is_square[j]: cnt += 1
+    while j>=0:
+        if is_sq[j]:
+            cnt += 1
         j = hierarchy[0,j,1]
     return cnt
 
-def get_contours(image, blur):
-    gray    = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (blur,blur), 0)
-    edges   = cv2.Canny(blurred, 50, 150)
-    dilated = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-    cnts, hierarchy = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    approx = [cv2.approxPolyDP(c, 0.04*cv2.arcLength(c,True),True) for c in cnts]
-    return approx, hierarchy
+def get_contours(img, blur):
+    gray    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurimg = cv2.GaussianBlur(gray,(blur,blur),0)
+    edges   = cv2.Canny(blurimg,50,150)
+    dil     = cv2.dilate(edges, np.ones((3,3),np.uint8),1)
+    cnts, hier = cv2.findContours(dil, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    approx = [cv2.approxPolyDP(c, 0.04*cv2.arcLength(c,True), True) for c in cnts]
+    return approx, hier
 
 def get_candidate_boards(cnts, hier, max_err, min_side, min_child):
-    info  = [check_square(c) for c in cnts]
+    info = [check_square(c) for c in cnts]
     is_sq = [(e<max_err and s>min_side) for e,s in info]
     boards = []
-    for i, ((e,s),c) in enumerate(zip(info,cnts)):
+    for i,((e,s),c) in enumerate(zip(info,cnts)):
         if is_sq[i] and child_count(i,hier,is_sq)>min_child:
             boards.append(c)
     return boards
 
-def preprocess(image):
-    all_boards = []
+def preprocess(img):
+    all_b = []
     for b in (3,5,7,9,11):
-        cnts, hier = get_contours(image, b)
-        all_boards += get_candidate_boards(cnts, hier, 4e2, 10, 10)
-    scored = [(b, check_square(b)[1]) for b in all_boards]
+        cnts, hier = get_contours(img,b)
+        all_b += get_candidate_boards(cnts,hier,4e2,10,10)
+    # pick the biggest (by side) within 90% of max
+    scored = [(c, check_square(c)[1]) for c in all_b]
     scored.sort(key=lambda x:-x[1])
     best = (None,0)
-    for brd,side in scored:
-        if side >= best[1]*0.9:
-            best = (brd, side)
+    for c,s in scored:
+        if s>=best[1]*0.9:
+            best=(c,s)
     return best[0]
 
-def crop_image(image, pts):
+def crop_image(img, pts):
     pts = np.squeeze(pts)
     x0,x1 = pts[:,0].min(), pts[:,0].max()
     y0,y1 = pts[:,1].min(), pts[:,1].max()
-    return image[y0:y1, x0:x1]
-
-# ── Custom layer & loss definitions ────────────────────────────────────────
-class ChessboardLayer(keras.layers.Layer):
-    def __init__(self, **kwargs):
-        # strip any unexpected kwargs for Keras3
-        kwargs.pop("dynamic", None)
-        super().__init__(**kwargs)
-
-    def call(self, inputs):
-        # inputs: [batch,H,W,C] → output [batch,8,8,features]
-        boards = tf.unstack(inputs, axis=0)
-        out = []
-        for b in boards:
-            b = tf.expand_dims(b,0)
-            rows = tf.split(b,8,axis=1)
-            cells = []
-            for r in rows:
-                cs = tf.split(r,8,axis=2)
-                flat = [tf.reshape(cc,(1,1,1,-1)) for cc in cs]
-                cells.append(tf.concat(flat,axis=2))
-            out.append(tf.concat(cells,axis=1))
-        return tf.concat(out,axis=0)
-
-    def compute_output_shape(self, input_shape):
-        b,H,W,C = input_shape
-        return (b,8,8,(H*W*C)//64)
-
-def weighted_loss(y_true,y_pred):
-    # identical to what model was trained with
-    weights = tf.constant([1.0 if k==0 else 4.0 if k%6==0 else 8.0
-                           for k in range(y_pred.shape[-1])], dtype=tf.float32)
-    weights /= tf.reduce_max(weights)
-    loss = keras.losses.sparse_categorical_crossentropy(y_true,y_pred)
-    idx  = tf.reshape(y_true,(-1,))
-    sw   = tf.reshape(tf.gather(weights,idx),loss.shape)
-    return sw * loss
+    return img[y0:y1, x0:x1]
 
 # ── Ensemble loading ──────────────────────────────────────────────────────
+
 LOAD = [
     ("model/model_a.h5", 0.5),
     ("model/model_b.h5", 0.5),
 ]
+
 _models = [
-  keras.models.load_model(
-    path,
-    custom_objects={
-      "ChessboardLayer": ChessboardLayer,
-      "weighted_loss": weighted_loss
-    },
-    compile=False
-  )
-  for path,_ in LOAD
+    keras.models.load_model(
+        path,
+        custom_objects={"ChessboardLayer":ChessboardLayer,
+                        "weighted_loss":weighted_loss},
+        compile=False
+    )
+    for path,_ in LOAD
 ]
 
-def ensemble_predict(x):
-    acc = np.zeros((1,64,13),dtype=np.float32)
-    for m,w in zip(_models,[w for _,w in LOAD]):
-        acc += m.predict(x) * w
-    return acc
+# Map index → piece letter (demo mapping)
+_index_to_letter = {
+    0:'-',   # empty
+    1:'N',2:'B',3:'R',4:'Q',5:'K',6:'P'
+}
 
-# ── FastAPI endpoint ─────────────────────────────────────────────────────
+def vector_to_class(grid):
+    vec = np.vectorize(lambda i: _index_to_letter[int(i)])
+    return vec(grid)
+
+def letters_to_fen(letter_grid):
+    rows=[]
+    for r in range(8):
+        empties=0; row=""
+        for c in letter_grid[r]:
+            if c=='-':
+                empties+=1
+            else:
+                if empties:
+                    row+=str(empties)
+                    empties=0
+                row+=c
+        if empties:
+            row+=str(empties)
+        rows.append(row)
+    return "/".join(rows)+" w - - 0 1"
+
+# ── The POST /scan endpoint ────────────────────────────────────────────────
+
 @app.post("/scan")
 async def scan_chessboard(file: UploadFile = File(...)):
+    # 1) Read & decode
     data = await file.read()
-    arr  = np.frombuffer(data,dtype=np.uint8)
-    img  = cv2.imdecode(arr,cv2.IMREAD_COLOR)
+    arr  = np.frombuffer(data, np.uint8)
+    img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
+    # 2) Detect & crop → warp
     pts     = preprocess(img)
-    cropped = crop_image(img,pts)
-    cropped = cv2.resize(cropped,(512,512),cv2.INTER_AREA)
+    cropped = crop_image(img, pts)
+    cropped = cv2.resize(cropped, (512,512), interpolation=cv2.INTER_AREA)
 
-    inp = cropped.astype(np.float32) / 255.0            # shape (512,512,3)
-    inp = inp[None, ...]                                # shape (1,512,512,3)
+    # 3) Grayscale normalize & shape= (1,512,512,1)
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    inp  = (gray.astype(np.float32)/255.0)[...,None][None,...]
 
-    preds = ensemble_predict(inp)            # (1,64,13)
-    grid  = np.argmax(preds,axis=-1).reshape(8,8)
+    # 4) Ensemble predict
+    y_acc = np.zeros((1,64,7), dtype=np.float32)
+    for m,( _, w ) in zip(_models, LOAD):
+        y_acc += m.predict(inp) * w
 
-    # map to chars + make FEN
-    idx2ltr = {i:ch for i,ch in enumerate(
-      ['p','n','b','r','q','k','P','N','B','R','Q','K','-']
-    )}
-    letter_grid = np.vectorize(lambda i: idx2ltr[int(i)])(grid)
-    rows = []
-    for rnk in letter_grid:
-      cnt, rstr = 0, ""
-      for c in rnk:
-        if c=="-": cnt+=1
-        else:
-          if cnt: rstr+=str(cnt); cnt=0
-          rstr+=c
-      if cnt: rstr+=str(cnt)
-      rows.append(rstr)
-    fen = "/".join(rows) + " w - - 0 1"
+    grid = np.argmax(y_acc, axis=-1).reshape(8,8)  # ints 0–6
 
-    # overlay
-    overlay = cv2.cvtColor(gray,cv2.COLOR_GRAY2BGR)
+    # 5) To letters & FEN
+    letters = vector_to_class(grid)
+    fen     = letters_to_fen(letters)
+
+    # 6) Overlay letters on FFT→BGR
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for i in range(8):
-      for j in range(8):
-        cv2.putText(overlay, letter_grid[i,j],
-                    (j*64+5, i*64+50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                    (0,255,255), 2)
+        for j in range(8):
+            cv2.putText(overlay, letters[i,j],
+                        (j*64+5, i*64+50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 2)
 
-    _,buf = cv2.imencode(".png",overlay)
-    data_uri = "data:image/png;base64," + base64.b64encode(buf).decode()
+    # 7) Encode to PNG/base64
+    _, buf = cv2.imencode(".png", overlay)
+    b64     = base64.b64encode(buf).decode("utf-8")
+    data_uri = f"data:image/png;base64,{b64}"
 
+    # 8) Return
     return {"fen": fen, "image": data_uri}
