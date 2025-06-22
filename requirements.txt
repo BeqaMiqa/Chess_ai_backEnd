@@ -1,7 +1,7 @@
 fastapi
-uvicorn[standard]
-python-multipart      # for file uploads
+python-multipart
 opencv-python-headless
-tensorflow            # or tensorflow-cpu
+tensorflow-cpu>=2.11.0,<2.12.0
+uvicorn       # (if you haven’t already)
 numpy
 Pillow                # to encode the overlay image
