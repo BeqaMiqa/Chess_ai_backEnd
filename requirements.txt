@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-multipart      # for file uploads
+opencv-python-headless
+tensorflow            # or tensorflow-cpu
+numpy
+Pillow                # to encode the overlay image
