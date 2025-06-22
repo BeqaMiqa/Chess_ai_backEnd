@@ -181,43 +181,47 @@ def letters_to_fen(letter_grid):
 
 @app.post("/scan")
 async def scan_chessboard(file: UploadFile = File(...)):
-    # 1) Read & decode
+    # 1) Read & decode to OpenCV BGR
     data = await file.read()
     arr  = np.frombuffer(data, np.uint8)
     img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    # 2) Detect & crop → warp
+    # 2) Detect & crop
     pts     = preprocess(img)
     cropped = crop_image(img, pts)
     cropped = cv2.resize(cropped, (512,512), interpolation=cv2.INTER_AREA)
 
-    # 3) Grayscale normalize & shape= (1,512,512,1)
-    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-    inp  = (gray.astype(np.float32)/255.0)[...,None][None,...]
+    # ── Model Prediction on COLOR input ───────────────────────────────────
+    # normalize to [0,1]
+    inp_color = cropped.astype(np.float32) / 255.0
+    # shape → (1,512,512,3)
+    inp_color = np.expand_dims(inp_color, 0)
 
-    # 4) Ensemble predict
+    # ensemble:
     y_acc = np.zeros((1,64,7), dtype=np.float32)
-    for m,( _, w ) in zip(_models, LOAD):
-        y_acc += m.predict(inp) * w
+    for model, (_, w) in zip(_models, LOAD):
+        y_acc += model.predict(inp_color) * w
 
-    grid = np.argmax(y_acc, axis=-1).reshape(8,8)  # ints 0–6
+    grid = np.argmax(y_acc, axis=-1).reshape(8,8)
 
-    # 5) To letters & FEN
+    # ── Now convert to letters & FEN (unchanged) ────────────────────────
     letters = vector_to_class(grid)
     fen     = letters_to_fen(letters)
 
-    # 6) Overlay letters on FFT→BGR
+    # ── Overlay on GRAY for a nice debug image ─────────────────────────
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for i in range(8):
         for j in range(8):
             cv2.putText(overlay, letters[i,j],
-                        (j*64+5, i*64+50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 2)
+                        (j*64 + 5, i*64 + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2, (0,255,255), 2)
 
-    # 7) Encode to PNG/base64
+    # ── Encode to PNG/base64 ────────────────────────────────────────────
     _, buf = cv2.imencode(".png", overlay)
     b64     = base64.b64encode(buf).decode("utf-8")
     data_uri = f"data:image/png;base64,{b64}"
 
-    # 8) Return
     return {"fen": fen, "image": data_uri}
+
