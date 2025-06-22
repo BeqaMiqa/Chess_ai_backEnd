@@ -3,4 +3,6 @@ __pycache__/
 .DS_Store
 .env
 *.log
+
+# ignore only the big single model, not a & b
 model/board_level_model.h5
