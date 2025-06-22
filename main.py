@@ -1,34 +1,31 @@
 # main.py
 
-import io
 import base64
+import io
 
 import numpy as np
 import cv2
 from PIL import Image
 
-import tensorflow as tf
-from tensorflow import keras
-
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+
+from tensorflow import keras
 
 # ── FastAPI + CORS setup ─────────────────────────────────────────────────
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # in production, tighten this to your frontend’s origin
+    allow_origins=["*"],      # tighten this in production!
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# ── Board Detection & Cropping Helpers (from demo2.ipynb) ─────────────────
+# ── Board Detection & Cropping Helpers (from your demo2.ipynb) ────────────
 
 def get_angle(ab, ac):
-    # angle between vectors ab and ac
     cosv = (ab @ ac) / (np.linalg.norm(ab) * np.linalg.norm(ac))
     cosv = np.clip(cosv, -1, 1)
     return np.degrees(np.arccos(cosv))
@@ -56,11 +53,9 @@ def child_count(i, hierarchy, is_square):
     j = hierarchy[0, i, 2]
     if j < 0:
         return 0
-    # find first child
     while hierarchy[0, j, 0] > 0:
         j = hierarchy[0, j, 0]
     count = 0
-    # count all square siblings
     while j >= 0:
         if is_square[j]:
             count += 1
@@ -92,11 +87,10 @@ def get_candidate_boards(contours, hierarchy, max_error, min_side, min_child):
 
 def preprocess(image):
     all_boards = []
-    for blur in (3, 5, 7, 9, 11):
+    for blur in (3,5,7,9,11):
         contours, hierarchy = get_contours(image, blur)
         candidates = get_candidate_boards(contours, hierarchy, 4e2, 10, 10)
         all_boards.extend(candidates)
-    # score by side length, pick best within 90% of max
     scored = [(b, check_square(b)[1]) for b in all_boards]
     scored.sort(key=lambda x: x[1], reverse=True)
     best = (None, 0)
@@ -111,7 +105,8 @@ def crop_image(image, points):
     y0, y1 = pts[:,1].min(), pts[:,1].max()
     return image[y0:y1, x0:x1]
 
-# ── Model Inference Helpers ────────────────────────────────────────────────
+
+# ── Model Ensemble Helpers ────────────────────────────────────────────────
 
 # Map index → piece letter
 _index_to_letter = {
@@ -121,7 +116,6 @@ _index_to_letter = {
 }
 
 def vector_to_class(grid):
-    # grid: 8×8 of ints 0–12 → chars
     vec = np.vectorize(lambda idx: _index_to_letter[int(idx)])
     return vec(grid)
 
@@ -140,19 +134,29 @@ def letters_to_fen(letter_grid):
         if empties:
             row += str(empties)
         rows.append(row)
-    # Append default “side to move”, castling, etc.
     return "/".join(rows) + " w - - 0 1"
 
-# ── Load model at startup ─────────────────────────────────────────────────
+# Load the two small models with equal weight
+LOAD = [
+    ("model/model_a.h5", 0.5),
+    ("model/model_b.h5", 0.5),
+]
+_models = [keras.models.load_model(path, compile=False) for path,_ in LOAD]
 
-MODEL_PATH = "model/board_level_model.h5"
-board_model = keras.models.load_model(MODEL_PATH, compile=False)
+def ensemble_predict(inp: np.ndarray) -> np.ndarray:
+    """Run both models and return weighted average predictions."""
+    accum = np.zeros((1, 64, 13), dtype=np.float32)
+    for m, w in zip(_models, [w for _,w in LOAD]):
+        p = m.predict(inp)  # (1,64,13)
+        accum += p * w
+    return accum
 
-# ── FastAPI route ─────────────────────────────────────────────────────────
+
+# ── FastAPI Route ────────────────────────────────────────────────────────
 
 @app.post("/scan")
 async def scan_chessboard(file: UploadFile = File(...)):
-    # 1) Read bytes & decode to OpenCV image
+    # 1) Read & decode image
     data = await file.read()
     arr  = np.frombuffer(data, dtype=np.uint8)
     img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -160,37 +164,36 @@ async def scan_chessboard(file: UploadFile = File(...)):
     # 2) Detect & crop the board
     pts     = preprocess(img)
     cropped = crop_image(img, pts)
-    cropped = cv2.resize(cropped, (512, 512), interpolation=cv2.INTER_AREA)
+    cropped = cv2.resize(cropped, (512,512), interpolation=cv2.INTER_AREA)
 
-    # 3) Grayscale & normalize for CNN
+    # 3) Grayscale & normalize
     gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-    inp  = (gray.astype(np.float32) / 255.0)[..., None][None, ...]
+    inp  = (gray.astype(np.float32)/255.0)[...,None][None,...]
 
-    # 4) Predict all 64 squares at once
-    preds = board_model.predict(inp)               # (1,64,13)
-    grid  = np.argmax(preds, axis=-1).reshape(8, 8)
+    # 4) Ensemble predict
+    preds = ensemble_predict(inp)         # (1,64,13)
+    grid  = np.argmax(preds, axis=-1).reshape(8,8)
 
-    # 5) Convert to letters & FEN
+    # 5) To letters & FEN
     letters = vector_to_class(grid)
     fen     = letters_to_fen(letters)
 
-    # 6) Overlay letters on the gray board
+    # 6) Overlay letters on the gray image
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for i in range(8):
         for j in range(8):
             cv2.putText(
-                overlay, letters[i, j],
-                (j*64 + 5, i*64 + 50),
+                overlay, letters[i,j],
+                (j*64+5, i*64+50),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.2, (0, 255, 255), 2
+                1.2, (0,255,255), 2
             )
 
     # 7) Encode PNG → base64
-    _, buf = cv2.imencode(".png", overlay)
-    b64     = base64.b64encode(buf).decode("utf-8")
-    data_uri = f"data:image/png;base64,{b64}"
+    _, buf   = cv2.imencode(".png", overlay)
+    data_uri = "data:image/png;base64," + base64.b64encode(buf).decode("utf-8")
 
-    # 8) Return JSON
+    # 8) Return JSON payload
     return {
         "fen": fen,
         "image": data_uri
